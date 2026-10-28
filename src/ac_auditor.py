@@ -71,6 +71,17 @@ _SINONIMOS = {
 
 _UNIFESP_RE = re.compile(r"\bunifesp\b|\bict\b")
 
+# Atividades aceitas pelo regulamento que o auditor sugere para preencher
+# um eixo pendente (subconjunto das entradas de _SINONIMOS, as mais acessíveis).
+_SUGESTOES_EIXO = {
+    1: ["doação de sangue", "serviços sociais e voluntariado",
+        "atividades de extensão", "centro acadêmico ou atlética"],
+    2: ["monitoria, tutoria ou orientação", "recepção de calouros e matrículas",
+        "orientação sobre os cursos para ensino médio"],
+    3: ["eventos científicos como ouvinte", "cursos de línguas estrangeiras",
+        "iniciação científica", "estágio não obrigatório"],
+}
+
 
 def _norm(text: str) -> str:
     t = "".join(
@@ -80,11 +91,126 @@ def _norm(text: str) -> str:
     return re.sub(r"\s+", " ", t).strip()
 
 
+# ── Camada neural: similaridade com as atividades aceitas do Art. 3º ─────────
+# Quando o casamento léxico falha ("dei aula de reforço", "fui ouvinte na
+# SBPC"), a descrição é comparada por embedding com a DESCRIÇÃO OFICIAL de cada
+# atividade aceita no regulamento. Mundo fechado com abstenção: só aceita com
+# proximidade real (piso) E vitória clara sobre o melhor de OUTRO eixo
+# (margem). Calibrado no embeddinggemma: positivos 0.47-0.59 c/ margem
+# >= 0.06; fora do regulamento (academia, garçom, Netflix) <= 0.47 c/ margem
+# <= 0.065, abstém.
+_SEM_PISO = 0.44
+_SEM_MARGEM = 0.06
+_TIPO_CANONICO = {
+    "Organização de eventos": "organização de eventos externos",
+    "Serviços sociais": "serviços sociais e voluntariado",
+    "Atividades artísticas": "atividades artísticas",
+    "Concursos e exposições": "concursos culturais ou exposições",
+    "Doação e cadastros": "doação de sangue",
+    "Participação em entidades estudantis": "centro acadêmico ou atlética",
+    "Monitoria e tutoria": "monitoria, tutoria ou orientação",
+    "Mobilidade internacional": "recepção de estudantes estrangeiros",
+    "Orientação acadêmica - DAE": "atividades da DAE",
+    "Apoio estudantil": "atividades do NAE ou NAI",
+    "Orientação vocacional": "orientação sobre os cursos para ensino médio",
+    "Recepção de calouros": "recepção de calouros e matrículas",
+    "Iniciação Científica": "iniciação científica",
+    "Eventos científicos - ouvinte": "eventos científicos como ouvinte",
+    "Apresentação de trabalhos": "apresentação de trabalhos",
+    "Competições": "competições científicas e tecnológicas",
+    "Estágio não obrigatório": "estágio não obrigatório",
+    "Atividade profissional": "atividade profissional em C&T",
+    "Cursos de línguas": "cursos de línguas estrangeiras",
+    "Unidades Curriculares Optativas": "UC optativa",
+}
+_SEM = {"emb": None, "mat": None, "protos": []}
+
+
+def configurar_semantica(embeddings_model) -> None:
+    """Embute uma vez as descrições oficiais das atividades aceitas (Art. 3º)."""
+    if embeddings_model is None or _SEM["mat"] is not None:
+        return
+    # Comparação SIMÉTRICA (atividade x atividade), não busca: tira os
+    # prefixos de tarefa query/documento (TaskPrefixEmbeddings) e o lote, que
+    # comprimem a escala e deixavam "academia" acima de casos reais.
+    base = embeddings_model
+    for _ in range(5):
+        inner = getattr(base, "__dict__", {}).get("_inner")
+        if inner is None:
+            break
+        base = inner
+    embeddings_model = base
+    try:
+        import numpy as np
+        reg = json.loads(_REGULAMENTO_PATH.read_text(encoding="utf-8"))
+        protos = []
+        for chave, eixo in reg["artigos"]["artigo_3"]["eixos"].items():
+            n = int(chave.rsplit("_", 1)[-1])
+            for a in eixo.get("atividades_aceitas", []):
+                protos.append((n, a["tipo"], a["descricao"]))
+        mat = np.array(embeddings_model.embed_documents([p[2] for p in protos]),
+                       dtype="float32")
+        mat /= (np.linalg.norm(mat, axis=1, keepdims=True) + 1e-9)
+        _SEM.update({"emb": embeddings_model, "mat": mat, "protos": protos})
+        print(f"AC semântico: {len(protos)} atividades do Art. 3º embutidas", flush=True)
+    except Exception as e:
+        _SEM["mat"] = None
+        print(f"AC semântico indisponível: {e!r}", flush=True)
+
+
+def _so_atividade(descricao: str) -> str:
+    """Tira a quantidade ("60 horas", "40 de") antes de comparar com o
+    regulamento: horas não dizem nada sobre o TIPO e diluem a similaridade."""
+    t = _HORAS_RE.sub(" ", descricao or "")
+    t = re.sub(r"^\s*\d+(?:[.,]\d+)?\s+", " ", t)
+    t = re.sub(r"^\s*(?:de|em|como|com)\s+", "", t.strip(), flags=re.IGNORECASE)
+    return re.sub(r"\s+", " ", t).strip()
+
+
+def _classificar_semantico(descricao: str) -> Optional[Dict]:
+    descricao = _so_atividade(descricao)
+    if _SEM["mat"] is None or not descricao:
+        return None
+    try:
+        import numpy as np
+        q = np.array(_SEM["emb"].embed_query(descricao), dtype="float32")
+        nq = np.linalg.norm(q)
+        if nq == 0:
+            return None
+        sims = _SEM["mat"] @ (q / nq)
+        ordem = np.argsort(-sims)
+        top = int(ordem[0])
+        eixo_top = _SEM["protos"][top][0]
+        outro = next((int(j) for j in ordem[1:] if _SEM["protos"][int(j)][0] != eixo_top), None)
+        margem = float(sims[top] - (sims[outro] if outro is not None else 0.0))
+        if float(sims[top]) < _SEM_PISO or margem < _SEM_MARGEM:
+            return None
+        tipo = _SEM["protos"][top][1]
+        return {
+            "eixo": eixo_top,
+            "eixo_nome": _EIXO_NOMES[eixo_top],
+            "atividade": _TIPO_CANONICO.get(tipo, tipo.lower()),
+            "metodo": "semantico",
+            "similaridade": round(float(sims[top]), 2),
+        }
+    except Exception:
+        return None
+
+
 def classificar_eixo(descricao: str) -> Optional[Dict]:
     """
-    Classifica uma atividade no eixo pelo casamento com as atividades aceitas
-    do regulamento. Retorna {eixo, eixo_nome, atividade} ou None se nada casa.
+    Classifica uma atividade no eixo: primeiro pelo casamento com as
+    atividades aceitas do regulamento (léxico); se nada casa, pela
+    similaridade semântica com as descrições oficiais do Art. 3º, com
+    abstenção. Retorna {eixo, eixo_nome, atividade, metodo} ou None.
     """
+    lex = _classificar_lexico(descricao)
+    if lex:
+        return lex
+    return _classificar_semantico(descricao)
+
+
+def _classificar_lexico(descricao: str) -> Optional[Dict]:
     d = f" {_norm(descricao)} "
     melhor = None
     melhor_tam = 0
@@ -97,6 +223,7 @@ def classificar_eixo(descricao: str) -> Optional[Dict]:
                         "eixo": eixo,
                         "eixo_nome": _EIXO_NOMES[eixo],
                         "atividade": atividade,
+                        "metodo": "lexico",
                     }
                     melhor_tam = len(chave)
     return melhor
@@ -105,6 +232,8 @@ def classificar_eixo(descricao: str) -> Optional[Dict]:
 _ITEM_SPLIT_RE = re.compile(
     r"[;\n]+|,\s+(?=\d)|\.\s+(?=\d)"
     r"|\s+e\s+(?:tamb[eé]m\s+)?(?:tenho\s+)?(?=\d)"
+    # "... e trabalhei 60 horas como ...": verbo entre o "e" e o número
+    r"|\s+e\s+(?:tamb[eé]m\s+)?(?=(?:[a-zà-ú]+\s+){1,2}\d+(?:[.,]\d+)?\s*h)"
     r"|,\s+(?:tamb[eé]m\s+)?(?:tenho\s+)?(?=\d)"
 )
 _HORAS_RE = re.compile(r"(\d+(?:[.,]\d+)?)\s*h(?:oras?|rs?)?\b")
@@ -127,6 +256,23 @@ def _limpar_leadin(seg: str) -> str:
     return limpo if limpo else seg
 
 
+# Cauda interrogativa colada ao último item ("60h de IC, vale como AC?",
+# "40 de IC. Quanto falta?") não faz parte da descrição da atividade.
+_CAUDA_PERGUNTA_RE = re.compile(
+    r"\s*[.,;!]?\s*\b(?:isso\s+)?(?:vale|valem|conta|contam|serve|servem|"
+    r"quanto|quantas?|quantos|o\s+que|da\s+pra|dá\s+pra|e\s+agora|ja\s+posso|já\s+posso)\b.*$"
+    r"|\s*\?.*$",
+    re.IGNORECASE,
+)
+# "80 horas de monitoria e 40 de IC": o 2º item herda a unidade do 1º.
+_NUM_SEM_UNIDADE_RE = re.compile(r"^(\d+(?:[.,]\d+)?)\s+(?:de|em)\s+\S")
+
+
+def _descricao(seg: str) -> str:
+    desc = _CAUDA_PERGUNTA_RE.sub("", _limpar_leadin(seg)).strip(" ,.;")
+    return desc or _limpar_leadin(seg)
+
+
 def parsear_atividades(texto: str) -> List[Dict]:
     """
     Extrai itens {descricao, horas, instituicao} de uma lista em linguagem
@@ -134,14 +280,19 @@ def parsear_atividades(texto: str) -> List[Dict]:
     (e reportados ao aluno para correção).
     """
     itens = []
-    for bruto in _ITEM_SPLIT_RE.split(texto or ""):
-        seg = bruto.strip(" .,-")
+    segmentos = [b.strip(" .,-") for b in _ITEM_SPLIT_RE.split(texto or "")]
+    tem_unidade = any(_HORAS_RE.search(s) for s in segmentos if s)
+    for seg in segmentos:
         if not seg:
             continue
         m = _HORAS_RE.search(seg)
-        if not m:
-            continue
-        horas = float(m.group(1).replace(",", "."))
+        if m:
+            horas = float(m.group(1).replace(",", "."))
+        else:
+            mn = _NUM_SEM_UNIDADE_RE.match(_limpar_leadin(seg)) if tem_unidade else None
+            if not mn:
+                continue
+            horas = float(mn.group(1).replace(",", "."))
         if horas <= 0:
             continue
         instituicao = None
@@ -149,7 +300,7 @@ def parsear_atividades(texto: str) -> List[Dict]:
         if mi:
             instituicao = mi.group(1).strip()
         itens.append({
-            "descricao": _limpar_leadin(seg),
+            "descricao": _descricao(seg),
             "horas": horas,
             "instituicao": instituicao,
         })
@@ -561,8 +712,12 @@ def formatar_auditoria(resultado: Dict) -> str:
         linhas.append("")
         linhas.append("Como classifiquei cada atividade:")
         for r in resultado["itens"]:
+            via = (
+                f" · por similaridade com o Art. 3º do regulamento ({r['similaridade']:.2f})"
+                if r.get("metodo") == "semantico" else ""
+            )
             linhas.append(
-                f"- {r['descricao']} → eixo {r['eixo']} ({r['atividade']})"
+                f"- {r['descricao']} → eixo {r['eixo']} ({r['atividade']}){via}"
             )
     if resultado["nao_classificados"]:
         linhas.append("")
@@ -583,11 +738,53 @@ def formatar_auditoria(resultado: Dict) -> str:
         for a in resultado["avisos"]:
             linhas.append(f"- {a}")
 
+    plano = _plano_ac(resultado)
+    if plano:
+        linhas.append("")
+        linhas.append("**O que fazer agora:**")
+        linhas.extend(f"- {p}" for p in plano)
+
     linhas.append("")
     linhas.append(
         _rodape_regras(resultado.get("curso", "BCT"))
     )
     return "\n".join(linhas)
+
+
+def _plano_ac(resultado: Dict) -> List[str]:
+    """
+    Próximos passos derivados das regras (sem LLM): o que cada eixo pendente
+    aceita e quanto do que falta o teto do Eixo I ainda comporta.
+    """
+    if resultado.get("apto"):
+        return []
+    regras = REGRAS_CURSO.get(resultado.get("curso", "BCT"), REGRAS_CURSO["BCT"])
+    brutas, validas = resultado["horas_brutas"], resultado["horas_validas"]
+    passos = []
+    for eixo in (1, 2, 3):
+        if brutas[eixo] < MIN_POR_EIXO:
+            opcoes = _SUGESTOES_EIXO[eixo]
+            passos.append(
+                f"{_EIXO_NOMES[eixo]}: falta pelo menos {MIN_POR_EIXO}h. Valem, por "
+                f"exemplo: {', '.join(opcoes[:-1])} ou {opcoes[-1]}."
+            )
+    faltam = resultado["faltam"]
+    teto = regras.get("teto_eixo1")
+    if faltam > 0 and teto:
+        folga_1 = max(0.0, teto - validas[1])
+        resto = max(0.0, faltam - folga_1)
+        if resto > 0:
+            passos.append(
+                f"Das {faltam:.0f}h que faltam, no máximo {folga_1:.0f}h podem vir do "
+                f"Eixo I (teto de {teto}h). Pelo menos **{resto:.0f}h** precisam vir "
+                "dos Eixos II e III."
+            )
+        else:
+            passos.append(
+                f"As {faltam:.0f}h que faltam cabem no Eixo I, que ainda comporta "
+                f"{folga_1:.0f}h até o teto de {teto}h."
+            )
+    return passos
 
 
 def _rodape_regras(curso: str) -> str:

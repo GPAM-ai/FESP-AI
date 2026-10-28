@@ -367,6 +367,7 @@ def build_pipeline(rag_instance):
             responder_checklist,
             registrar_atividades,
             is_reset_ac,
+            configurar_semantica as ac_configurar_semantica,
         )
         from ..progresso import (
             is_progresso_request,
@@ -396,6 +397,7 @@ def build_pipeline(rag_instance):
         from .. import comunicados
         try:  # intenção por SIMILARIDADE semântica (não por lista de palavras)
             oferta_real.configurar_semantica(getattr(rag_instance, "embeddings", None))
+            ac_configurar_semantica(getattr(rag_instance, "embeddings", None))
             contatos_docentes.configurar(getattr(rag_instance, "embeddings", None))
             semantic_router.configurar(getattr(rag_instance, "embeddings", None))
             comunicados.configurar(getattr(rag_instance, "embeddings", None))

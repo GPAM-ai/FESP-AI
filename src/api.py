@@ -322,6 +322,22 @@ async def startup_event():
         except Exception as e:
             print(f"KG warmup falhou (não-fatal): {e}")
 
+        # Pipeline completo: os classificadores semânticos (oferta, contatos,
+        # roteador, eixos de AC) só se configuram na 1ª pergunta real, que
+        # pagava ~10-16s após cada restart. Chama o pipeline direto (não o
+        # /chat) para não gravar estes turnos no log de produção.
+        try:
+            t0 = time.perf_counter()
+            for q in (
+                "Quero chegar em Compiladores, já fiz Lógica de Programação",
+                "E se eu reprovar em Matemática Discreta, o que atrasa?",
+                "Tenho 40 horas de monitoria. Quanto falta de atividades complementares?",
+            ):
+                rag.query_with_metadata(q, history="", original_question=q, historico={})
+            print(f"Pipeline warmup: caminhos de demo prontos em {time.perf_counter() - t0:.1f}s")
+        except Exception as e:
+            print(f"Pipeline warmup falhou (não-fatal): {e}")
+
     threading.Thread(target=warmup_pyreason, daemon=True).start()
 
 

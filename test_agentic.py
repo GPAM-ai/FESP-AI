@@ -438,6 +438,68 @@ texto_pg = progresso.formatar_progresso(res_par)
 check("resposta do progresso menciona oferta prevista pela paridade",
       "paridade do termo" in texto_pg, texto_pg[:300])
 
+print(f"\n{BOLD}AC: unidade herdada, cauda da pergunta e plano de ação{RESET}")
+it_u = auditor.parsear_atividades(
+    "Tenho 80 horas de monitoria e 40 de iniciação científica. Quanto falta de atividades complementares?"
+)
+check("'40 de IC' herda a unidade de '80 horas'",
+      [i["horas"] for i in it_u] == [80, 40], str(it_u))
+check("cauda 'Quanto falta…' não entra na descrição",
+      it_u[1]["descricao"] == "40 de iniciação científica", it_u[1]["descricao"])
+it_v = auditor.parsear_atividades(
+    "Fiz 40 horas de monitoria e 60 horas de iniciação científica, vale como atividade complementar?"
+)
+check("cauda 'vale como AC?' não entra na descrição",
+      it_v[1]["descricao"] == "60 horas de iniciação científica", it_v[1]["descricao"])
+it_verbo = auditor.parsear_atividades(
+    "Fiz 80 horas de monitoria e 40 horas de iniciação científica e trabalhei 60 horas como desenvolvedor.")
+check("'... e trabalhei 60 horas como ...' vira um terceiro item",
+      [i["horas"] for i in it_verbo] == [80, 40, 60], str(it_verbo))
+check("número solto sem nenhuma unidade na frase não vira hora",
+      auditor.parsear_atividades("fiz 3 de monitoria") == [])
+txt_plano = auditor.formatar_auditoria(auditor.auditar_atividades(it_v))
+check("plano cita o eixo pendente com atividades do regulamento",
+      "O que fazer agora" in txt_plano and "doação de sangue" in txt_plano, txt_plano[-500:])
+check("plano deriva do teto do Eixo I quanto precisa vir dos Eixos II e III (212-104=108)",
+      "108h" in txt_plano, txt_plano[-400:])
+r_apto = auditor.auditar_atividades(auditor.parsear_atividades(
+    "104h de voluntariado; 104h de monitoria; 104h de iniciação científica"))
+check("aluno apto não recebe plano", "O que fazer agora" not in auditor.formatar_auditoria(r_apto))
+
+print(f"\n{BOLD}AC: camada semântica (Art. 3º) com abstenção{RESET}")
+
+
+class _FakeEmb:
+    """Embedding de brinquedo: cada protótipo vira um eixo canônico do espaço;
+    a consulta 'reforço' fica perto do protótipo de monitoria, 'academia' fica
+    equidistante (deve abster)."""
+
+    def embed_documents(self, textos):
+        self._n = len(textos)
+        self._idx = {t: i for i, t in enumerate(textos)}
+        return [[1.0 if j == i else 0.0 for j in range(self._n)] for i in range(self._n)]
+
+    def embed_query(self, texto):
+        alvo = next(i for t, i in self._idx.items() if t.startswith("Participação como monitor"))
+        if "reforço" in texto:
+            return [0.9 if j == alvo else 0.05 for j in range(self._n)]
+        return [1.0] * self._n
+
+
+auditor._SEM.update({"emb": None, "mat": None, "protos": []})
+auditor.configurar_semantica(_FakeEmb())
+c_sem = auditor.classificar_eixo("dei aula de reforço para a turma")
+check("descrição fora do léxico classifica pelo Art. 3º (eixo 2)",
+      c_sem and c_sem["eixo"] == 2 and c_sem["metodo"] == "semantico", str(c_sem))
+check("sem vencedor claro, abstém (fui à academia)",
+      auditor.classificar_eixo("fui à academia") is None)
+check("léxico continua tendo prioridade", auditor.classificar_eixo("80h de monitoria")["metodo"] == "lexico")
+txt_sem = auditor.formatar_auditoria(auditor.auditar_atividades(
+    auditor.parsear_atividades("30 horas de aula de reforço")))
+check("resposta mostra que a classificação foi por similaridade com o regulamento",
+      "similaridade com o Art. 3º" in txt_sem, txt_sem[:400])
+auditor._SEM.update({"emb": None, "mat": None, "protos": []})
+
 total = _passed + _failed
 cor = GREEN if _failed == 0 else RED
 print(f"\n{BOLD}{cor}{_passed}/{total} testes passaram{RESET}\n")
