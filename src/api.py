@@ -200,6 +200,7 @@ class ChatResponse(BaseModel):
     ac_data: Optional[Dict] = None
     suggestions: Optional[List[str]] = None
     relatorio: Optional[bool] = None
+    sources: Optional[List[Dict]] = None
 
 
 class ConversationResponse(BaseModel):
@@ -510,6 +511,20 @@ def chat(request: ChatRequest):
             icon=agent_metadata.get("icon", "Bot"),
         )
     
+    # Rodapé "Fontes": de onde veio a resposta (origem oficial, com link).
+    # Só no texto devolvido ao aluno: o histórico guardado fica sem ele, para
+    # não poluir o contexto que o LLM relê nos próximos turnos.
+    fontes = []
+    try:
+        from .fontes import resolver_fontes, formatar_rodape
+        from .workflow.second_chance import is_miss_response
+        if not is_miss_response(response_text):
+            fontes = resolver_fontes(result, request.message,
+                                     getattr(rag, "knowledge_graph", None))
+            response_text = response_text + formatar_rodape(fontes)
+    except Exception as e:
+        logger.warning(f"[FONTES] falha ao montar rodapé: {e}")
+
     return ChatResponse(
         response=response_text,
         conversation_id=conversation_id,
@@ -523,6 +538,7 @@ def chat(request: ChatRequest):
         ac_data=ac_data,
         relatorio=relatorio_flag or None,
         suggestions=suggestions,
+        sources=fontes or None,
     )
 
 
